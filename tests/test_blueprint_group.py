@@ -1,11 +1,18 @@
 import pytest
 
 from pytest import raises
+from sanic_routing.exceptions import RouteExists
 
 from sanic.app import Sanic
 from sanic.blueprint_group import BlueprintGroup
 from sanic.blueprints import Blueprint
-from sanic.exceptions import BadRequest, Forbidden, SanicException, ServerError
+from sanic.exceptions import (
+    BadRequest,
+    Forbidden,
+    NotFound,
+    SanicException,
+    ServerError,
+)
 from sanic.request import Request
 from sanic.response import HTTPResponse, text
 
@@ -389,3 +396,159 @@ async def test_multiple_nested_bp_group():
         "PropTest.group-b_bp1.route1",
         "PropTest.group-b_bp2.route2",
     ]
+
+
+def test_bp_group_failed_registration_leaves_no_members(app: Sanic):
+    bp1 = Blueprint("bp1", url_prefix="/bp1")
+    bp2 = Blueprint("bp2", url_prefix="/bp2")
+
+    @bp1.get("/one")
+    def one(request: Request):
+        return text("one")
+
+    @bp2.get("/two")
+    def two(request: Request):
+        return text("two")
+
+    @bp1.middleware("request")
+    def middleware(request: Request): ...
+
+    @bp1.listener("before_server_start")
+    async def listener(app: Sanic): ...
+
+    @bp1.exception(NotFound)
+    def handler(request: Request, exception: Exception):
+        return text("not found")
+
+    @bp1.signal("my.custom.signal")
+    def signal(**kwargs): ...
+
+    existing = Blueprint("shared")
+    app.blueprint(existing)
+
+    group = Blueprint.group(bp1, bp2, Blueprint("shared"))
+
+    with raises(AssertionError):
+        app.blueprint(group)
+
+    # No member of the failed group may remain visible
+    assert list(app.blueprints) == ["shared"]
+    assert app._blueprint_order == [existing]
+    assert list(app.router.routes) == []
+    assert not bp1.registered
+    assert not bp2.registered
+    assert bp1.routes == []
+    assert bp1.middlewares == []
+    assert bp1.exceptions == []
+    assert bp1.listeners == {}
+    assert len(app.request_middleware) == 0
+    assert len(app.response_middleware) == 0
+    assert app.named_request_middleware == {}
+    assert app.named_response_middleware == {}
+    assert app.error_handler.cached_handlers == {}
+    assert app.listeners == {}
+    assert list(app.signal_router.routes) == []
+    assert app._future_registry == set()
+
+
+def test_bp_group_failed_registration_retry_is_deterministic(app: Sanic):
+    bp1 = Blueprint("bp1", url_prefix="/bp1")
+
+    @bp1.get("/one")
+    def one(request: Request):
+        return text("one")
+
+    existing = Blueprint("shared")
+    app.blueprint(existing)
+    group = Blueprint.group(bp1, Blueprint("shared"))
+
+    for _ in range(2):
+        with raises(AssertionError):
+            app.blueprint(group)
+        assert list(app.blueprints) == ["shared"]
+        assert list(app.router.routes) == []
+        assert not bp1.registered
+
+
+def test_bp_group_members_can_register_after_group_failure(app: Sanic):
+    bp1 = Blueprint("bp1", url_prefix="/bp1")
+
+    @bp1.get("/one")
+    def one(request: Request):
+        return text("one")
+
+    existing = Blueprint("shared")
+    app.blueprint(existing)
+
+    with raises(AssertionError):
+        app.blueprint(Blueprint.group(bp1, Blueprint("shared")))
+
+    app.blueprint(bp1)
+    _, response = app.test_client.get("/bp1/one")
+    assert response.status == 200
+    assert response.text == "one"
+
+
+def test_bp_group_registration_is_atomic_on_route_conflict(app: Sanic):
+    @app.get("/taken")
+    def taken(request: Request):
+        return text("taken")
+
+    bp1 = Blueprint("bp1", url_prefix="/bp1")
+    bp2 = Blueprint("bp2")
+
+    @bp1.get("/one")
+    def one(request: Request):
+        return text("one")
+
+    @bp2.get("/taken")
+    def two(request: Request):
+        return text("two")
+
+    with raises(RouteExists):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert list(app.blueprints) == []
+    assert not bp1.registered
+    assert not bp2.registered
+    assert [route.path for route in app.router.routes] == ["taken"]
+
+    _, response = app.test_client.get("/taken")
+    assert response.status == 200
+    assert response.text == "taken"
+
+
+def test_nested_bp_group_registration_is_atomic(app: Sanic):
+    inner1 = Blueprint("inner1", url_prefix="/i1")
+    inner2 = Blueprint("inner2", url_prefix="/i2")
+
+    @inner1.get("/one")
+    def one(request: Request):
+        return text("one")
+
+    @inner2.get("/two")
+    def two(request: Request):
+        return text("two")
+
+    outer1 = Blueprint("outer1", url_prefix="/outer1")
+
+    @outer1.get("/three")
+    def three(request: Request):
+        return text("three")
+
+    existing = Blueprint("shared")
+    app.blueprint(existing)
+
+    inner = Blueprint.group(inner1, inner2, url_prefix="/inner")
+    outer = Blueprint.group(
+        outer1, inner, Blueprint("shared"), url_prefix="/outer"
+    )
+
+    with raises(AssertionError):
+        app.blueprint(outer)
+
+    assert list(app.blueprints) == ["shared"]
+    assert list(app.router.routes) == []
+    assert not outer1.registered
+    assert not inner1.registered
+    assert not inner2.registered

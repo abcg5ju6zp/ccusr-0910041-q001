@@ -163,6 +163,47 @@ class Blueprint(BaseSanic):
         self.statics: list[RouteHandler] = []
         self.websocket_routes: list[Route] = []
 
+    def _snapshot_state(
+        self,
+    ) -> tuple[
+        set[Sanic],
+        list[Route],
+        list[Route],
+        list[MiddlewareType],
+        list[RouteHandler],
+        dict[str, list[ListenerType[Any]]],
+    ]:
+        """项目内部接口说明。"""
+        return (
+            set(self._apps),
+            list(self.routes),
+            list(self.websocket_routes),
+            list(self.middlewares),
+            list(self.exceptions),
+            {event: list(items) for event, items in self.listeners.items()},
+        )
+
+    def _restore_state(self, state) -> None:
+        """项目内部接口说明。"""
+        (
+            apps,
+            routes,
+            websocket_routes,
+            middlewares,
+            exceptions,
+            listeners,
+        ) = state
+        self._apps.clear()
+        self._apps.update(apps)
+        self.routes[:] = routes
+        self.websocket_routes[:] = websocket_routes
+        self.middlewares[:] = middlewares
+        self.exceptions[:] = exceptions
+        self.listeners.clear()
+        self.listeners.update(
+            {event: list(items) for event, items in listeners.items()}
+        )
+
     def copy(
         self,
         name: str,
@@ -250,6 +291,14 @@ class Blueprint(BaseSanic):
         return bps
 
     def register(self, app, options):
+        """项目内部接口说明。"""
+        with app._registration_transaction():
+            app._track_registration(
+                partial(self._restore_state, self._snapshot_state())
+            )
+            self._register(app, options)
+
+    def _register(self, app, options):
         """项目内部接口说明。"""
 
         self._apps.add(app)

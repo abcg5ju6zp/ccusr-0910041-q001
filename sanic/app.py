@@ -139,6 +139,7 @@ class Sanic(
         "_future_statics",
         "_inspector",
         "_manager",
+        "_registration_undo",
         "_state",
         "_task_registry",
         "_test_client",
@@ -302,6 +303,7 @@ class Sanic(
         self._future_registry: FutureRegistry = FutureRegistry()
         self._inspector: Inspector | None = None
         self._manager: WorkerManager | None = None
+        self._registration_undo: list[Callable[[], None]] | None = None
         self._state: ApplicationState = ApplicationState(app=self)
         self._task_registry: dict[str, Task | None] = {}
         self._test_client: Any = None
@@ -630,6 +632,174 @@ class Sanic(
 
         self.websocket_enabled = enable
 
+    @contextmanager
+    def _registration_transaction(self) -> Iterator[None]:
+        """项目内部接口说明。"""
+        if self._registration_undo is not None:
+            # A transaction is already active (for example, while
+            # registering a blueprint group). The outermost frame owns the
+            # snapshot and performs the rollback, so nested frames only
+            # record their undo callbacks and yield.
+            yield
+            return
+
+        undo: list[Callable[[], None]] = []
+        snapshot = self._snapshot_registration()
+        self._registration_undo = undo
+        try:
+            yield
+        except BaseException:
+            for rollback in reversed(undo):
+                try:
+                    rollback()
+                except Exception:
+                    error_logger.exception(
+                        "Error while rolling back blueprint registration"
+                    )
+            self._restore_registration(snapshot)
+            raise
+        finally:
+            self._registration_undo = None
+
+    def _track_registration(self, rollback: Callable[[], None]) -> None:
+        """项目内部接口说明。"""
+        if self._registration_undo is not None:
+            self._registration_undo.append(rollback)
+
+    def _snapshot_registration(self) -> dict[str, Any]:
+        """项目内部接口说明。"""
+        return {
+            "router": self._snapshot_router(self.router),
+            "signal_router": self._snapshot_router(self.signal_router),
+            "request_middleware": deque(self.request_middleware),
+            "response_middleware": deque(self.response_middleware),
+            "named_request_middleware": {
+                name: deque(middleware)
+                for name, middleware in self.named_request_middleware.items()
+            },
+            "named_response_middleware": {
+                name: deque(middleware)
+                for name, middleware in self.named_response_middleware.items()
+            },
+            "cached_handlers": dict(self.error_handler.cached_handlers),
+            "listeners": {
+                event: list(items) for event, items in self.listeners.items()
+            },
+            "future_commands": set(self._future_commands),
+            "future_exceptions": set(self._future_exceptions),
+            "future_listeners": list(self._future_listeners),
+            "future_middleware": list(self._future_middleware),
+            "future_routes": set(self._future_routes),
+            "future_signals": set(self._future_signals),
+            "future_statics": set(self._future_statics),
+            "future_registry": set(self._future_registry),
+            "websocket_enabled": self.websocket_enabled,
+            "blueprints": dict(self.blueprints),
+            "blueprint_order": list(self._blueprint_order),
+        }
+
+    @staticmethod
+    def _snapshot_router(
+        router: Router | SignalRouter,
+    ) -> dict[str, Any]:
+        """项目内部接口说明。"""
+        return {
+            "static_routes": dict(router.static_routes),
+            "dynamic_routes": dict(router.dynamic_routes),
+            "regex_routes": dict(router.regex_routes),
+            "name_index": dict(router.name_index),
+            "finalized": router.finalized,
+        }
+
+    def _restore_registration(self, snapshot: dict[str, Any]) -> None:
+        """项目内部接口说明。"""
+        for router, key in (
+            (self.router, "router"),
+            (self.signal_router, "signal_router"),
+        ):
+            state = snapshot[key]
+            for attr in (
+                "static_routes",
+                "dynamic_routes",
+                "regex_routes",
+                "name_index",
+            ):
+                pool = getattr(router, attr)
+                pool.clear()
+                pool.update(state[attr])
+
+        self.request_middleware.clear()
+        self.request_middleware.extend(snapshot["request_middleware"])
+        self.response_middleware.clear()
+        self.response_middleware.extend(snapshot["response_middleware"])
+        self.named_request_middleware.clear()
+        self.named_request_middleware.update(
+            {
+                name: deque(middleware)
+                for name, middleware in snapshot[
+                    "named_request_middleware"
+                ].items()
+            }
+        )
+        self.named_response_middleware.clear()
+        self.named_response_middleware.update(
+            {
+                name: deque(middleware)
+                for name, middleware in snapshot[
+                    "named_response_middleware"
+                ].items()
+            }
+        )
+        self.error_handler.cached_handlers.clear()
+        self.error_handler.cached_handlers.update(snapshot["cached_handlers"])
+        self.listeners.clear()
+        self.listeners.update(
+            {
+                event: list(items)
+                for event, items in snapshot["listeners"].items()
+            }
+        )
+        for attr in (
+            "_future_commands",
+            "_future_exceptions",
+            "_future_listeners",
+            "_future_middleware",
+            "_future_routes",
+            "_future_signals",
+            "_future_statics",
+            "_future_registry",
+        ):
+            collection = getattr(self, attr)
+            saved = snapshot[attr[1:]]
+            collection.clear()
+            if isinstance(collection, list):
+                collection.extend(saved)
+            else:
+                collection.update(saved)
+        self.websocket_enabled = snapshot["websocket_enabled"]
+        self.blueprints.clear()
+        self.blueprints.update(snapshot["blueprints"])
+        self._blueprint_order[:] = snapshot["blueprint_order"]
+
+        # When the app is already serving requests, the compiled routers
+        # must be brought back in line with the restored state so that
+        # rolled back members stay unreachable.
+        if snapshot["router"]["finalized"]:
+            self.router.reset()
+            self.finalize()
+        elif self.router.finalized:
+            self.router.reset()
+        if snapshot["signal_router"]["finalized"]:
+            self.signal_router.reset()
+            try:
+                self.signalize(cast(bool, self.config.TOUCHUP))
+            except RuntimeError:
+                # Signals cannot be finalized outside of a running event
+                # loop. They will be finalized again on the next startup.
+                pass
+        elif self.signal_router.finalized:
+            self.signal_router.reset()
+
     def blueprint(
         self,
         blueprint: Blueprint | Iterable[Blueprint] | BlueprintGroup,
@@ -653,52 +823,56 @@ class Sanic(
         if name_prefix is not None:
             options["name_prefix"] = name_prefix
         if isinstance(blueprint, (Iterable, BlueprintGroup)):
-            for item in blueprint:
-                params: dict[str, Any] = {**options}
-                if isinstance(blueprint, BlueprintGroup):
-                    merge_from = [
-                        options.get("url_prefix", ""),
-                        blueprint.url_prefix or "",
-                    ]
-                    if not isinstance(item, BlueprintGroup):
-                        merge_from.append(item.url_prefix or "")
-                    merged_prefix = "/".join(
-                        str(u).strip("/") for u in merge_from if u
-                    ).rstrip("/")
-                    params["url_prefix"] = f"/{merged_prefix}"
+            with self._registration_transaction():
+                for item in blueprint:
+                    params: dict[str, Any] = {**options}
+                    if isinstance(blueprint, BlueprintGroup):
+                        merge_from = [
+                            options.get("url_prefix", ""),
+                            blueprint.url_prefix or "",
+                        ]
+                        if not isinstance(item, BlueprintGroup):
+                            merge_from.append(item.url_prefix or "")
+                        merged_prefix = "/".join(
+                            str(u).strip("/") for u in merge_from if u
+                        ).rstrip("/")
+                        params["url_prefix"] = f"/{merged_prefix}"
 
-                    for _attr in ["version", "strict_slashes"]:
-                        if getattr(item, _attr) is None:
-                            params[_attr] = getattr(
-                                blueprint, _attr
-                            ) or options.get(_attr)
-                    if item.version_prefix == "/v":
-                        if blueprint.version_prefix == "/v":
-                            params["version_prefix"] = options.get(
-                                "version_prefix"
-                            )
-                        else:
-                            params["version_prefix"] = blueprint.version_prefix
-                    name_prefix = getattr(blueprint, "name_prefix", None)
-                    if name_prefix and "name_prefix" not in params:
-                        params["name_prefix"] = name_prefix
-                self.blueprint(item, **params)
+                        for _attr in ["version", "strict_slashes"]:
+                            if getattr(item, _attr) is None:
+                                params[_attr] = getattr(
+                                    blueprint, _attr
+                                ) or options.get(_attr)
+                        if item.version_prefix == "/v":
+                            if blueprint.version_prefix == "/v":
+                                params["version_prefix"] = options.get(
+                                    "version_prefix"
+                                )
+                            else:
+                                params["version_prefix"] = (
+                                    blueprint.version_prefix
+                                )
+                        name_prefix = getattr(blueprint, "name_prefix", None)
+                        if name_prefix and "name_prefix" not in params:
+                            params["name_prefix"] = name_prefix
+                    self.blueprint(item, **params)
             return
-        if blueprint.name in self.blueprints:
-            assert self.blueprints[blueprint.name] is blueprint, (
-                'A blueprint with the name "%s" is already registered.  '
-                "Blueprint names must be unique." % (blueprint.name,)
-            )
-        else:
-            self.blueprints[blueprint.name] = blueprint
-            self._blueprint_order.append(blueprint)
+        with self._registration_transaction():
+            if blueprint.name in self.blueprints:
+                assert self.blueprints[blueprint.name] is blueprint, (
+                    'A blueprint with the name "%s" is already registered.  '
+                    "Blueprint names must be unique." % (blueprint.name,)
+                )
+            else:
+                self.blueprints[blueprint.name] = blueprint
+                self._blueprint_order.append(blueprint)
 
-        if (
-            self.strict_slashes is not None
-            and blueprint.strict_slashes is None
-        ):
-            blueprint.strict_slashes = self.strict_slashes
-        blueprint.register(self, options)
+            if (
+                self.strict_slashes is not None
+                and blueprint.strict_slashes is None
+            ):
+                blueprint.strict_slashes = self.strict_slashes
+            blueprint.register(self, options)
 
     def url_for(self, view_name: str, **kwargs):
         """项目内部接口说明。"""

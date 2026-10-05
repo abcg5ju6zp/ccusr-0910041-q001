@@ -4,10 +4,18 @@ import os
 
 import pytest
 
+from sanic_routing.exceptions import RouteExists
+
 from sanic.app import Sanic
 from sanic.blueprints import Blueprint
 from sanic.constants import HTTP_METHODS
-from sanic.exceptions import BadRequest, NotFound, SanicException, ServerError
+from sanic.exceptions import (
+    BadRequest,
+    InvalidSignal,
+    NotFound,
+    SanicException,
+    ServerError,
+)
 from sanic.request import Request
 from sanic.response import json, text
 
@@ -1150,3 +1158,160 @@ def test_blueprint_copy_returns_blueprint_with_overwritten_properties(
         for key, value in expected.items()
         if hasattr(actual, key)
     )
+
+
+def test_blueprint_failed_registration_leaves_no_members(app: Sanic):
+    bp = Blueprint("failure", url_prefix="/fail")
+
+    @bp.get("/route")
+    def handler(request):
+        return text("route")
+
+    @bp.middleware("request")
+    def middleware(request): ...
+
+    @bp.exception(NotFound)
+    def exc_handler(request, exception):
+        return text("not found")
+
+    @bp.signal("my.custom.signal")
+    def signal(**kwargs): ...
+
+    bp.listener("not_a_valid_event")(lambda app: ...)
+
+    with pytest.raises(KeyError):
+        app.blueprint(bp)
+
+    assert "failure" not in app.blueprints
+    assert app._blueprint_order == []
+    assert not bp.registered
+    assert bp.routes == []
+    assert bp.middlewares == []
+    assert bp.exceptions == []
+    assert bp.listeners == {}
+    assert list(app.router.routes) == []
+    assert len(app.request_middleware) == 0
+    assert len(app.response_middleware) == 0
+    assert app.named_request_middleware == {}
+    assert app.named_response_middleware == {}
+    assert app.error_handler.cached_handlers == {}
+    assert app.listeners == {}
+    assert list(app.signal_router.routes) == []
+    assert app._future_registry == set()
+
+
+def test_blueprint_failed_registration_on_route_conflict(app: Sanic):
+    @app.get("/taken")
+    def taken(request):
+        return text("taken")
+
+    bp = Blueprint("conflicting")
+
+    @bp.get("/fresh")
+    def fresh(request):
+        return text("fresh")
+
+    @bp.get("/taken")
+    def clash(request):
+        return text("clash")
+
+    with pytest.raises(RouteExists):
+        app.blueprint(bp)
+
+    assert "conflicting" not in app.blueprints
+    assert not bp.registered
+    assert bp.routes == []
+    assert [route.path for route in app.router.routes] == ["taken"]
+
+    _, response = app.test_client.get("/taken")
+    assert response.status == 200
+    assert response.text == "taken"
+
+
+def test_blueprint_failed_registration_on_command(app: Sanic):
+    bp = Blueprint("with_command", url_prefix="/cmd")
+
+    @bp.get("/route")
+    def handler(request):
+        return text("route")
+
+    @bp.command
+    def my_command(): ...
+
+    with pytest.raises(SanicException):
+        app.blueprint(bp)
+
+    assert "with_command" not in app.blueprints
+    assert app._blueprint_order == []
+    assert not bp.registered
+    assert bp.routes == []
+    assert list(app.router.routes) == []
+    assert app._future_registry == set()
+
+
+def test_blueprint_failed_registration_on_duplicate_handler(app: Sanic):
+    bp = Blueprint("dup_handler", url_prefix="/dup")
+
+    @bp.get("/route")
+    def handler(request):
+        return text("route")
+
+    @bp.exception(NotFound)
+    def first_handler(request, exception):
+        return text("first")
+
+    @bp.exception(NotFound)
+    def second_handler(request, exception):
+        return text("second")
+
+    with pytest.raises(ServerError):
+        app.blueprint(bp)
+
+    assert "dup_handler" not in app.blueprints
+    assert not bp.registered
+    assert list(app.router.routes) == []
+    assert app.error_handler.cached_handlers == {}
+    assert app._future_registry == set()
+
+
+def test_blueprint_failed_registration_on_reserved_signal(app: Sanic):
+    bp = Blueprint("reserved", url_prefix="/reserved")
+
+    @bp.get("/route")
+    def handler(request):
+        return text("route")
+
+    bp.signal("http.lifecycle.reserved")(lambda **kwargs: ...)
+
+    with pytest.raises(InvalidSignal):
+        app.blueprint(bp)
+
+    assert "reserved" not in app.blueprints
+    assert not bp.registered
+    assert list(app.router.routes) == []
+    assert list(app.signal_router.routes) == []
+    assert app._future_registry == set()
+
+
+def test_blueprint_failed_registration_with_static(
+    app: Sanic, static_file_directory: str
+):
+    bp = Blueprint("with_static", url_prefix="/static")
+
+    bp.static("/files", static_file_directory, name="static_files")
+
+    @bp.get("/route")
+    def handler(request):
+        return text("route")
+
+    bp.listener("not_a_valid_event")(lambda app: ...)
+
+    future_routes = set(app._future_routes)
+    with pytest.raises(KeyError):
+        app.blueprint(bp)
+
+    assert "with_static" not in app.blueprints
+    assert not bp.registered
+    assert list(app.router.routes) == []
+    assert set(app._future_routes) == future_routes
+    assert app._future_registry == set()
