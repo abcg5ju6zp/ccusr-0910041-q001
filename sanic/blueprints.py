@@ -252,6 +252,13 @@ class Blueprint(BaseSanic):
     def register(self, app, options):
         """项目内部接口说明。"""
 
+        with app._blueprint_registration() as registration:
+            registration.track(self)
+            self._register(app, options)
+
+    def _register(self, app, options):
+        """项目内部接口说明。"""
+
         self._apps.add(app)
         url_prefix = options.get("url_prefix", self.url_prefix)
         opt_version = options.get("version", None)

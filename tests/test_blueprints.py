@@ -4,6 +4,8 @@ import os
 
 import pytest
 
+from sanic_routing.exceptions import RouteExists
+
 from sanic.app import Sanic
 from sanic.blueprints import Blueprint
 from sanic.constants import HTTP_METHODS
@@ -1150,3 +1152,63 @@ def test_blueprint_copy_returns_blueprint_with_overwritten_properties(
         for key, value in expected.items()
         if hasattr(actual, key)
     )
+
+
+def test_single_blueprint_registration_rolls_back_on_conflict(app: Sanic):
+    app.strict_slashes = True
+
+    @app.get("/taken")
+    def app_handler(request):
+        return text("app")
+
+    bp = Blueprint("bp", url_prefix="/taken")
+
+    @bp.get("")
+    def bp_handler(request):
+        return text("bp")
+
+    with pytest.raises(RouteExists):
+        app.blueprint(bp)
+
+    assert "bp" not in app.blueprints
+    assert app._blueprint_order == []
+    assert not bp.registered
+    assert bp.routes == []
+    assert bp.strict_slashes is None
+    assert app._future_registry == set()
+
+    _, response = app.test_client.get("/taken")
+    assert response.text == "app"
+    _, response = app.test_client.get("/taken/")
+    assert response.status == 404
+
+
+def test_blueprint_lazy_registration_rolls_back_on_conflict(app: Sanic):
+    bp = Blueprint("bp", url_prefix="/bp")
+
+    @bp.get("/one", name="one")
+    def one(request):
+        return text("one")
+
+    app.blueprint(bp)
+    routes_before = list(bp.routes)
+    registry_before = set(app._future_registry)
+
+    @app.get("/bp/two")
+    def two(request):
+        return text("app two")
+
+    with pytest.raises(RouteExists):
+        bp.get("/two", name="two")(two)
+
+    assert bp.routes == routes_before
+    assert set(app._future_registry) == registry_before
+    assert [route.name for route in app.router.routes] == [
+        f"{app.name}.bp.one",
+        f"{app.name}.two",
+    ]
+
+    _, response = app.test_client.get("/bp/one")
+    assert response.text == "one"
+    _, response = app.test_client.get("/bp/two")
+    assert response.text == "app two"

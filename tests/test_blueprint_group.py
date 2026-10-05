@@ -1,11 +1,18 @@
 import pytest
 
 from pytest import raises
+from sanic_routing.exceptions import RouteExists
 
 from sanic.app import Sanic
 from sanic.blueprint_group import BlueprintGroup
 from sanic.blueprints import Blueprint
-from sanic.exceptions import BadRequest, Forbidden, SanicException, ServerError
+from sanic.exceptions import (
+    BadRequest,
+    Forbidden,
+    InvalidSignal,
+    SanicException,
+    ServerError,
+)
 from sanic.request import Request
 from sanic.response import HTTPResponse, text
 
@@ -13,6 +20,69 @@ from sanic.response import HTTPResponse, text
 MIDDLEWARE_INVOKE_COUNTER = {"request": 0, "response": 0}
 
 AUTH = "dGVzdDp0ZXN0Cg=="
+
+
+def _full_bp(name: str, url_prefix: str | None = None) -> Blueprint:
+    bp = Blueprint(name, url_prefix=url_prefix or f"/{name}")
+
+    @bp.get("/")
+    async def handler(request):
+        return text(name)
+
+    @bp.listener("before_server_start")
+    async def listener(app, loop):
+        ...
+
+    @bp.listener("main_process_start")
+    async def main_listener(app):
+        ...
+
+    @bp.middleware("request")
+    async def middleware(request):
+        ...
+
+    @bp.exception(NotImplementedError)
+    async def exception_handler(request, exception):
+        return text("error")
+
+    @bp.signal("my.custom.signal")
+    async def signal_handler():
+        ...
+
+    return bp
+
+
+def _registration_state(app: Sanic):
+    return {
+        "blueprints": sorted(app.blueprints),
+        "order": [bp.name for bp in app._blueprint_order],
+        "routes": sorted(route.path for route in app.router.routes),
+        "route_names": sorted(
+            route.name or "" for route in app.router.routes
+        ),
+        "request_middleware": list(app.request_middleware),
+        "response_middleware": list(app.response_middleware),
+        "named_request_middleware": {
+            name: list(middleware)
+            for name, middleware in app.named_request_middleware.items()
+        },
+        "named_response_middleware": {
+            name: list(middleware)
+            for name, middleware in app.named_response_middleware.items()
+        },
+        "error_handlers": dict(app.error_handler.cached_handlers),
+        "listeners": {
+            event: list(listeners)
+            for event, listeners in app.listeners.items()
+        },
+        "signals": {
+            segments: tuple(route.handler for route in group.routes)
+            for segments, group in app.signal_router.groups.items()
+        },
+        "signal_names": sorted(app.signal_router.name_index),
+        "future_registry": set(app._future_registry),
+        "websocket_enabled": app.websocket_enabled,
+    }
 
 
 def test_bp_group_indexing(app: Sanic):
@@ -389,3 +459,249 @@ async def test_multiple_nested_bp_group():
         "PropTest.group-b_bp1.route1",
         "PropTest.group-b_bp2.route2",
     ]
+
+
+def test_bp_group_registration_atomic_on_name_conflict(app: Sanic):
+    existing = _full_bp("existing")
+    app.blueprint(existing)
+    state_before = _registration_state(app)
+
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("existing")
+
+    with raises(AssertionError, match="already registered"):
+        app.blueprint(Blueprint.group(bp1, bp2, url_prefix="/api"))
+
+    assert _registration_state(app) == state_before
+    assert not bp1.registered
+    assert bp1.routes == []
+    assert bp1.middlewares == []
+    assert bp1.exceptions == []
+    assert bp1.listeners == {}
+
+    _, response = app.test_client.get("/api/bp1")
+    assert response.status == 404
+    _, response = app.test_client.get("/existing")
+    assert response.status == 200
+
+
+def test_bp_group_registration_atomic_on_route_conflict(app: Sanic):
+    existing = _full_bp("existing")
+    app.blueprint(existing)
+    state_before = _registration_state(app)
+
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("bp2", url_prefix="/bp1")
+
+    with raises(RouteExists):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert _registration_state(app) == state_before
+    assert list(app.blueprints) == ["existing"]
+    assert [bp.name for bp in app._blueprint_order] == ["existing"]
+    assert not bp1.registered
+    assert not bp2.registered
+
+    _, response = app.test_client.get("/bp1")
+    assert response.status == 404
+    _, response = app.test_client.get("/existing")
+    assert response.status == 200
+
+
+def test_bp_group_registration_failure_is_deterministic_on_retry(app: Sanic):
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("bp2", url_prefix="/bp1")
+    group = Blueprint.group(bp1, bp2)
+
+    with raises(RouteExists):
+        app.blueprint(group)
+    state_after_first_failure = _registration_state(app)
+
+    with raises(RouteExists):
+        app.blueprint(group)
+    assert _registration_state(app) == state_after_first_failure
+
+
+def test_bp_group_registration_retry_after_fix(app: Sanic):
+    existing = _full_bp("existing")
+    app.blueprint(existing)
+
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("existing")
+
+    with raises(AssertionError, match="already registered"):
+        app.blueprint(Blueprint.group(bp1, bp2, url_prefix="/api"))
+
+    bp2_fixed = _full_bp("bp2")
+    app.blueprint(Blueprint.group(bp1, bp2_fixed, url_prefix="/api"))
+
+    paths = [route.path for route in app.router.routes]
+    assert sorted(paths) == ["api/bp1", "api/bp2", "existing"]
+    assert list(app.blueprints) == ["existing", "bp1", "bp2"]
+
+    _, response = app.test_client.get("/api/bp1")
+    assert response.status == 200
+    _, response = app.test_client.get("/api/bp2")
+    assert response.status == 200
+
+
+def test_nested_bp_group_registration_atomic(app: Sanic):
+    existing = _full_bp("existing")
+    app.blueprint(existing)
+    state_before = _registration_state(app)
+
+    outer_good = _full_bp("outer_good")
+    inner_good = _full_bp("inner_good")
+    inner_bad = _full_bp("existing")
+    inner = Blueprint.group(inner_good, inner_bad, url_prefix="/inner")
+    outer = Blueprint.group(outer_good, inner, url_prefix="/outer")
+
+    with raises(AssertionError, match="already registered"):
+        app.blueprint(outer)
+
+    assert _registration_state(app) == state_before
+    assert not outer_good.registered
+    assert not inner_good.registered
+
+    _, response = app.test_client.get("/outer/outer_good")
+    assert response.status == 404
+    _, response = app.test_client.get("/outer/inner/inner_good")
+    assert response.status == 404
+
+
+def test_bp_group_registration_atomic_on_listener_error(app: Sanic):
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("bp2")
+
+    @bp2.listener("not_a_valid_event")
+    async def bad_listener(app, loop):
+        ...
+
+    with raises(KeyError):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert app.blueprints == {}
+    assert app.router.routes == ()
+    assert not bp1.registered
+    assert not bp2.registered
+
+
+def test_bp_group_registration_atomic_on_signal_error(app: Sanic):
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("bp2")
+
+    @bp2.signal("this.has.too.many.parts")
+    async def bad_signal():
+        ...
+
+    with raises(InvalidSignal):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert app.blueprints == {}
+    assert app.router.routes == ()
+    assert not bp1.registered
+    assert not bp2.registered
+
+
+def test_bp_group_registration_atomic_on_duplicate_exception_handler(
+    app: Sanic,
+):
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("bp2")
+
+    @bp2.exception(NotImplementedError)
+    async def duplicate_handler(request, exception):
+        return text("duplicate")
+
+    with raises(ServerError, match="Duplicate exception handler"):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert app.blueprints == {}
+    assert app.router.routes == ()
+    assert not bp1.registered
+    assert not bp2.registered
+
+
+def test_bp_group_registration_atomic_on_command(app: Sanic):
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("bp2")
+
+    @bp2.command(name="cmd")
+    async def command():
+        ...
+
+    with raises(SanicException, match="Registering commands"):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert app.blueprints == {}
+    assert app.router.routes == ()
+    assert not bp1.registered
+    assert not bp2.registered
+
+
+def test_bp_group_registration_atomic_on_websocket(app: Sanic):
+    existing = _full_bp("existing")
+    app.blueprint(existing)
+    state_before = _registration_state(app)
+
+    bp1 = Blueprint("bp1", url_prefix="/bp1")
+
+    @bp1.websocket("/ws")
+    async def websocket_handler(request, ws):
+        ...
+
+    bp2 = _full_bp("existing")
+
+    with raises(AssertionError, match="already registered"):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert _registration_state(app) == state_before
+    assert app.websocket_enabled is False
+    assert not bp1.registered
+
+
+def test_bp_group_failed_late_registration_keeps_app_consistent(app: Sanic):
+    app.config.TOUCHUP = False
+
+    @app.get("/home")
+    async def home(request):
+        return text("home")
+
+    bp1 = _full_bp("bp1")
+    bp2 = _full_bp("bp2", url_prefix="/bp1")
+
+    @app.before_server_start
+    async def register_late(app):
+        with raises(RouteExists):
+            app.blueprint(Blueprint.group(bp1, bp2))
+
+    _, response = app.test_client.get("/home")
+    assert response.status == 200
+    assert response.text == "home"
+
+    _, response = app.test_client.get("/bp1")
+    assert response.status == 404
+    assert app.blueprints == {}
+    assert not bp1.registered
+    assert not bp2.registered
+
+
+def test_bp_group_registration_atomic_with_static(
+    app: Sanic, static_file_directory
+):
+    existing = _full_bp("existing")
+    app.blueprint(existing)
+    state_before = _registration_state(app)
+
+    bp1 = Blueprint("bp1", url_prefix="/bp1")
+    bp1.static("/files", static_file_directory, name="files")
+    bp2 = _full_bp("existing")
+
+    with raises(AssertionError, match="already registered"):
+        app.blueprint(Blueprint.group(bp1, bp2))
+
+    assert _registration_state(app) == state_before
+    assert bp1.routes == []
+
+    _, response = app.test_client.get("/bp1/files/test.file")
+    assert response.status == 404

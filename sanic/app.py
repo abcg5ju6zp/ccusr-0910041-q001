@@ -106,6 +106,152 @@ ctx_type = TypeVar("ctx_type")
 config_type = TypeVar("config_type", bound=Config)
 
 
+class BlueprintRegistration:
+    """项目内部接口说明。"""
+
+    def __init__(self, app: Sanic) -> None:
+        self.app = app
+        self.blueprints = dict(app.blueprints)
+        self.blueprint_order = list(app._blueprint_order)
+        self.future_registry = set(app._future_registry)
+        self.websocket_enabled = app.websocket_enabled
+        self.request_middleware = deque(app.request_middleware)
+        self.response_middleware = deque(app.response_middleware)
+        self.named_request_middleware = {
+            name: deque(middleware)
+            for name, middleware in app.named_request_middleware.items()
+        }
+        self.named_response_middleware = {
+            name: deque(middleware)
+            for name, middleware in app.named_response_middleware.items()
+        }
+        self.error_handlers = dict(app.error_handler.cached_handlers)
+        self.listeners = {
+            event: list(listeners)
+            for event, listeners in app.listeners.items()
+        }
+        self.router_state = self._snapshot_router(app.router)
+        self.signal_router_state = self._snapshot_router(app.signal_router)
+        self.router_finalized = app.router.finalized
+        self.signal_router_finalized = app.signal_router.finalized
+        self.blueprint_states: dict[Blueprint, dict[str, Any]] = {}
+
+    @staticmethod
+    def _snapshot_router(
+        router: Router | SignalRouter,
+    ) -> tuple[
+        dict[tuple[str, ...], Any],
+        dict[tuple[str, ...], Any],
+        dict[tuple[str, ...], Any],
+        dict[str, Any],
+    ]:
+        return (
+            dict(router.static_routes),
+            dict(router.dynamic_routes),
+            dict(router.regex_routes),
+            dict(router.name_index),
+        )
+
+    @staticmethod
+    def _restore_router(
+        router: Router | SignalRouter,
+        state: tuple[
+            dict[tuple[str, ...], Any],
+            dict[tuple[str, ...], Any],
+            dict[tuple[str, ...], Any],
+            dict[str, Any],
+        ],
+    ) -> None:
+        static_routes, dynamic_routes, regex_routes, name_index = state
+        router.static_routes.clear()
+        router.static_routes.update(static_routes)
+        router.dynamic_routes.clear()
+        router.dynamic_routes.update(dynamic_routes)
+        router.regex_routes.clear()
+        router.regex_routes.update(regex_routes)
+        router.name_index.clear()
+        router.name_index.update(name_index)
+
+    def track(self, blueprint: Blueprint) -> None:
+        """项目内部接口说明。"""
+        if blueprint in self.blueprint_states:
+            return
+        self.blueprint_states[blueprint] = {
+            "apps": set(blueprint._apps),
+            "routes": list(blueprint.routes),
+            "websocket_routes": list(blueprint.websocket_routes),
+            "middlewares": list(blueprint.middlewares),
+            "exceptions": list(blueprint.exceptions),
+            "listeners": {
+                event: list(listeners)
+                for event, listeners in blueprint.listeners.items()
+            },
+            "strict_slashes": blueprint.strict_slashes,
+        }
+
+    def restore(self) -> None:
+        """项目内部接口说明。"""
+        app = self.app
+        self._restore_router(app.router, self.router_state)
+        self._restore_router(app.signal_router, self.signal_router_state)
+        for cached in (app.router.get, app.router.find_route_by_view_name):
+            cache_clear = getattr(cached, "cache_clear", None)
+            if cache_clear is not None:
+                cache_clear()
+
+        app.blueprints.clear()
+        app.blueprints.update(self.blueprints)
+        app._blueprint_order[:] = self.blueprint_order
+        app._future_registry.clear()
+        app._future_registry.update(self.future_registry)
+        app.websocket_enabled = self.websocket_enabled
+        app.request_middleware.clear()
+        app.request_middleware.extend(self.request_middleware)
+        app.response_middleware.clear()
+        app.response_middleware.extend(self.response_middleware)
+        app.named_request_middleware.clear()
+        app.named_request_middleware.update(
+            {
+                name: deque(middleware)
+                for name, middleware in self.named_request_middleware.items()
+            }
+        )
+        app.named_response_middleware.clear()
+        app.named_response_middleware.update(
+            {
+                name: deque(middleware)
+                for name, middleware in self.named_response_middleware.items()
+            }
+        )
+        app.error_handler.cached_handlers.clear()
+        app.error_handler.cached_handlers.update(self.error_handlers)
+        app.listeners.clear()
+        app.listeners.update(
+            {
+                event: list(listeners)
+                for event, listeners in self.listeners.items()
+            }
+        )
+
+        for blueprint, state in self.blueprint_states.items():
+            blueprint._apps.clear()
+            blueprint._apps.update(state["apps"])
+            blueprint.routes[:] = state["routes"]
+            blueprint.websocket_routes[:] = state["websocket_routes"]
+            blueprint.middlewares[:] = state["middlewares"]
+            blueprint.exceptions[:] = state["exceptions"]
+            blueprint.listeners.clear()
+            blueprint.listeners.update(state["listeners"])
+            blueprint.strict_slashes = state["strict_slashes"]
+
+        if self.signal_router_finalized:
+            app.signal_router.reset()
+            app.signalize(cast(bool, app.config.TOUCHUP))
+        if self.router_finalized:
+            app.router.reset()
+            app.finalize()
+
+
 class Sanic(
     Generic[config_type, ctx_type],
     StaticHandleMixin,
@@ -123,6 +269,7 @@ class Sanic(
         "_run_request_middleware",
     )
     __slots__ = (
+        "_active_registration",
         "_asgi_app",
         "_asgi_lifespan",
         "_asgi_client",
@@ -294,6 +441,7 @@ class Sanic(
             self.config.INSPECTOR = inspector
 
         # Then we can do the rest
+        self._active_registration: BlueprintRegistration | None = None
         self._asgi_app: ASGIApp | None = None
         self._asgi_lifespan: Lifespan | None = None
         self._asgi_client: Any = None
@@ -630,6 +778,23 @@ class Sanic(
 
         self.websocket_enabled = enable
 
+    @contextmanager
+    def _blueprint_registration(self) -> Iterator[BlueprintRegistration]:
+        """项目内部接口说明。"""
+        registration = self._active_registration
+        if registration is not None:
+            yield registration
+            return
+        registration = BlueprintRegistration(self)
+        self._active_registration = registration
+        try:
+            yield registration
+        except BaseException:
+            registration.restore()
+            raise
+        finally:
+            self._active_registration = None
+
     def blueprint(
         self,
         blueprint: Blueprint | Iterable[Blueprint] | BlueprintGroup,
@@ -652,53 +817,57 @@ class Sanic(
             options["version_prefix"] = version_prefix
         if name_prefix is not None:
             options["name_prefix"] = name_prefix
-        if isinstance(blueprint, (Iterable, BlueprintGroup)):
-            for item in blueprint:
-                params: dict[str, Any] = {**options}
-                if isinstance(blueprint, BlueprintGroup):
-                    merge_from = [
-                        options.get("url_prefix", ""),
-                        blueprint.url_prefix or "",
-                    ]
-                    if not isinstance(item, BlueprintGroup):
-                        merge_from.append(item.url_prefix or "")
-                    merged_prefix = "/".join(
-                        str(u).strip("/") for u in merge_from if u
-                    ).rstrip("/")
-                    params["url_prefix"] = f"/{merged_prefix}"
+        with self._blueprint_registration() as registration:
+            if isinstance(blueprint, (Iterable, BlueprintGroup)):
+                for item in blueprint:
+                    params: dict[str, Any] = {**options}
+                    if isinstance(blueprint, BlueprintGroup):
+                        merge_from = [
+                            options.get("url_prefix", ""),
+                            blueprint.url_prefix or "",
+                        ]
+                        if not isinstance(item, BlueprintGroup):
+                            merge_from.append(item.url_prefix or "")
+                        merged_prefix = "/".join(
+                            str(u).strip("/") for u in merge_from if u
+                        ).rstrip("/")
+                        params["url_prefix"] = f"/{merged_prefix}"
 
-                    for _attr in ["version", "strict_slashes"]:
-                        if getattr(item, _attr) is None:
-                            params[_attr] = getattr(
-                                blueprint, _attr
-                            ) or options.get(_attr)
-                    if item.version_prefix == "/v":
-                        if blueprint.version_prefix == "/v":
-                            params["version_prefix"] = options.get(
-                                "version_prefix"
-                            )
-                        else:
-                            params["version_prefix"] = blueprint.version_prefix
-                    name_prefix = getattr(blueprint, "name_prefix", None)
-                    if name_prefix and "name_prefix" not in params:
-                        params["name_prefix"] = name_prefix
-                self.blueprint(item, **params)
-            return
-        if blueprint.name in self.blueprints:
-            assert self.blueprints[blueprint.name] is blueprint, (
-                'A blueprint with the name "%s" is already registered.  '
-                "Blueprint names must be unique." % (blueprint.name,)
-            )
-        else:
-            self.blueprints[blueprint.name] = blueprint
-            self._blueprint_order.append(blueprint)
+                        for _attr in ["version", "strict_slashes"]:
+                            if getattr(item, _attr) is None:
+                                params[_attr] = getattr(
+                                    blueprint, _attr
+                                ) or options.get(_attr)
+                        if item.version_prefix == "/v":
+                            if blueprint.version_prefix == "/v":
+                                params["version_prefix"] = options.get(
+                                    "version_prefix"
+                                )
+                            else:
+                                params["version_prefix"] = (
+                                    blueprint.version_prefix
+                                )
+                        name_prefix = getattr(blueprint, "name_prefix", None)
+                        if name_prefix and "name_prefix" not in params:
+                            params["name_prefix"] = name_prefix
+                    self.blueprint(item, **params)
+                return
+            registration.track(blueprint)
+            if blueprint.name in self.blueprints:
+                assert self.blueprints[blueprint.name] is blueprint, (
+                    'A blueprint with the name "%s" is already registered.  '
+                    "Blueprint names must be unique." % (blueprint.name,)
+                )
+            else:
+                self.blueprints[blueprint.name] = blueprint
+                self._blueprint_order.append(blueprint)
 
-        if (
-            self.strict_slashes is not None
-            and blueprint.strict_slashes is None
-        ):
-            blueprint.strict_slashes = self.strict_slashes
-        blueprint.register(self, options)
+            if (
+                self.strict_slashes is not None
+                and blueprint.strict_slashes is None
+            ):
+                blueprint.strict_slashes = self.strict_slashes
+            blueprint.register(self, options)
 
     def url_for(self, view_name: str, **kwargs):
         """项目内部接口说明。"""
@@ -1671,11 +1840,13 @@ class Sanic(
                 self.router.reset()
             if do_signal_router:
                 self.signal_router.reset()
-            yield
-            if do_signal_router:
-                self.signalize(cast(bool, self.config.TOUCHUP))
-            if do_router:
-                self.finalize()
+            try:
+                yield
+            finally:
+                if do_signal_router:
+                    self.signalize(cast(bool, self.config.TOUCHUP))
+                if do_router:
+                    self.finalize()
 
     def finalize(self) -> None:
         """项目内部接口说明。"""
